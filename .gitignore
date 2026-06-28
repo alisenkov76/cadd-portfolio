@@ -1,0 +1,15 @@
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+
+# MD files
+*.gro
+*.trr
+*.edr
+*.log
+*.tpr
+*.cpt
+data/md_test/
