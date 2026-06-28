@@ -1,0 +1,5 @@
+# Temporary MD test directory
+data/md_test/
+# Jupyter
+.ipynb_checkpoints/
+
