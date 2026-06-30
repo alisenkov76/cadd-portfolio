@@ -1,29 +1,49 @@
 #!/usr/bin/env python3
 """
-Просмотр gap-free записей.
-Показывает всю трассу с возможностью зума.
-Помогает найти временные интервалы для каждого напряжения.
+Интерактивный просмотр gap-free записей.
+
+Показывает трассу с тегами напряжения.
+Помогает найти где начались каналы.
+
+Запускется для каждого файла отдельно.
 """
 
 import pyabf
-import matplotlib.pyplot as plt
-import matplotlib.widgets as widgets
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 from pathlib import Path
 
 # ====================== НАСТРОЙКИ ======================
 
-FILES = [
-    "data/raw/26629000.abf",
-    "data/raw/26629001.abf",
-    "data/raw/26629002.abf",
-    "data/raw/26629003.abf",
-    "data/raw/26629004.abf",
-]
+# Смотрим по одному файлу
+FILE = "data/raw/26629000.abf"
 
-DECIMATE = 50
+# Децимация для отображения
+# 5000 Гц × 3000 сек = 15М точек → берём каждую 25-ю
+# итого ~600к точек → нормально
+DECIMATE = 25
+
+# Целевые напряжения (остальные теги не показываем)
+TARGET_VOLTAGES = {-150, -100, -50, 50, 100, 150}
+
+# Цвета для разных напряжений
+VOLTAGE_COLORS = {
+     50:  '#2196F3',   # синий
+    -50:  '#03A9F4',   # голубой
+     100: '#FF9800',   # оранжевый
+    -100: '#FF5722',   # красно-оранжевый
+     150: '#F44336',   # красный
+    -150: '#9C27B0',   # фиолетовый
+}
 
 # =======================================================
+
+
+def parse_voltage(comment: str):
+    import re
+    m = re.search(r'=>\s*(-?\d+(?:\.\d+)?)\s*mV', comment)
+    return float(m.group(1)) if m else None
 
 
 def browse_file(path: str) -> None:
@@ -37,64 +57,85 @@ def browse_file(path: str) -> None:
     t_dec = t[::DECIMATE]
     y_dec = y[::DECIMATE]
 
-    name = Path(path).name
+    name     = Path(path).name
     duration = abf.sweepLengthSec
 
     print(f"\n{'='*60}")
-    print(f"Файл: {name}")
-    print(f"Длина: {duration:.0f} сек  "
-          f"({duration/60:.1f} мин)")
-    print(f"Отображаем каждую {DECIMATE}-ю точку")
+    print(f"Файл:    {name}")
+    print(f"Длина:   {duration:.0f} сек ({duration/60:.1f} мин)")
+    print(f"Частота: {abf.dataRate} Гц")
+    print(f"\nТеги напряжения:")
 
-    fig, ax = plt.subplots(figsize=(16, 5))
+    # Парсим теги
+    tag_times    = abf.tagTimesSec
+    tag_comments = abf.tagComments
+
+    valid_tags = []
+    for t_tag, comment in zip(tag_times, tag_comments):
+        v = parse_voltage(comment)
+        if v is None:
+            continue
+        v_int = int(v)
+        marker = "✅" if v_int in TARGET_VOLTAGES else "⏭ "
+        print(f"  {marker} t={t_tag:8.1f}s  {v:+.0f} mV")
+        if v_int in TARGET_VOLTAGES:
+            valid_tags.append((t_tag, v_int))
+
+    # --- Основной график ---
+    fig, ax = plt.subplots(figsize=(18, 5))
 
     ax.plot(t_dec, y_dec,
-            color='steelblue',
-            linewidth=0.5,
-            alpha=0.85)
+            color='#455A64',
+            linewidth=0.4,
+            alpha=0.85,
+            label='Ток (pA)')
 
+    # Вертикальные линии тегов
+    for t_tag, v_int in valid_tags:
+        color = VOLTAGE_COLORS.get(v_int, 'gray')
+        ax.axvline(
+            t_tag,
+            color=color,
+            linewidth=1.5,
+            alpha=0.8,
+            linestyle='--'
+        )
+        ax.text(
+            t_tag + duration * 0.003,
+            ax.get_ylim()[1] if ax.get_ylim()[1] != 0 else 10,
+            f"{v_int:+d}",
+            fontsize=8,
+            color=color,
+            rotation=90,
+            va='top'
+        )
+
+    ax.axhline(0, color='black', lw=0.8, linestyle=':')
     ax.set_xlabel("Время (сек)", fontsize=12)
     ax.set_ylabel("Ток (pA)", fontsize=12)
     ax.set_title(
         f"{name}  |  {duration:.0f} сек  |  "
-        f"{abf.dataRate} Гц  |  gap-free",
-        fontsize=13
+        f"{abf.dataRate} Гц\n"
+        f"Используй zoom чтобы найти где начались каналы",
+        fontsize=12
     )
-    ax.grid(True, alpha=0.25)
+    ax.grid(True, alpha=0.2)
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(100))
+    ax.xaxis.set_minor_locator(ticker.MultipleLocator(50))
 
-    # Горизонтальные линии для ориентира
-    ax.axhline(0, color='black', lw=0.8, linestyle='--')
-
-    # Аннотация с подсказкой
-    ax.text(
-        0.01, 0.97,
-        "Zoom → запиши t_start, t_end для каждого напряжения",
-        transform=ax.transAxes,
-        fontsize=9,
-        va='top',
-        bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7)
-    )
 
     plt.tight_layout()
 
-    # Сохраняем обзорный график
-    out = Path("results") / f"overview_{Path(path).stem}.png"
+    out = Path("results") / f"browse_{Path(path).stem}.png"
     out.parent.mkdir(exist_ok=True)
-    plt.savefig(out, dpi=100)
-    print(f"  → сохранено: {out}")
-
+    plt.savefig(out, dpi=120)
+    print(f"\n→ сохранено: {out}")
     plt.show()
 
 
 if __name__ == "__main__":
-    print("ПРОСМОТР GAP-FREE ЗАПИСЕЙ")
-    print("="*60)
-    print("Для каждого файла:")
-    print("  1. Смотри на трассу")
-    print("  2. Находи участки стабильного тока")
-    print("  3. Записывай время начала и конца")
-    print("  4. Записывай напряжение (по знаку тока)")
-    print("="*60)
-
-    for f in FILES:
-        browse_file(f)
+    browse_file(FILE)
+    print("\nЧТО ДЕЛАТЬ:")
+    print("2. Найди где начались ступеньки (каналы)")
+    print("3. Запиши время начала каналов для каждого напряжения")
+    print("4. Перенеси в MANUAL_EXCLUDE в gapfree_iv_analysis.py")

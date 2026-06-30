@@ -16,14 +16,20 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import signal as scipy_signal
 from scipy.signal import find_peaks
+from scipy.ndimage import gaussian_filter1d
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
+import sys
+from pathlib import Path
+
+# Добавляем папку scripts/ в путь поиска модулей
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from parse_tags import get_voltage_intervals
 
 # ====================== НАСТРОЙКИ ======================
 
-# Контрольный файл (мембрана без грамицидина)
+# Контрольный файл 
 CONTROL_FILE = "data/raw/26629000.abf"
 
 # Экспериментальные файлы
@@ -33,6 +39,8 @@ EXP_FILES = [
     "data/raw/26629003.abf",
     "data/raw/26629004.abf",
 ]
+# стандартные потенциалы
+TARGET_VOLTAGES = {-150, -100, -50, 50, 100, 150}
 
 # Минимальная длительность интервала (сек)
 MIN_DURATION_SEC = 30.0
@@ -48,15 +56,46 @@ LOWPASS_HZ  = 400.0
 NOISE_WINDOW_MS = 50.0
 NOISE_THRESHOLD = 4.0
 
+# ====================== РУЧНЫЕ МАСКИ ======================
+#
+# Формат:
+# "имя_файла.abf": [
+#     (t_exclude_start, t_exclude_end),  # исключить этот участок
+# ]
+#
+# Используй browse_gapfree.py чтобы найти точные времена.
+#
+# Примеры:
+# - Нет каналов в начале файла:
+#     (0, 800)   → исключить первые 800 секунд
+# - Шумовой артефакт в середине:
+#     (1200, 1250)
+# - Весь файл без каналов:
+#     (0, 99999)  → исключит всё
+
+MANUAL_EXCLUDE = {
+    "26629001.abf": [
+        (0, 99999),      # нет каналов — весь файл
+    ],
+    "26629002.abf": [
+        (0, 1660),       # пример: каналы начались после 1660 сек
+    ],
+    "26629003.abf": [
+        (978, 1628), # пример: шумовые артефакты в середине
+        (4556,4747)
+    ],
+    "26629004.abf": [
+        (2343, 2574),       # пример: каналы начались после 1660 сек
+    ],
+    
+    # остальные файлы не трогаем
+}
+# ==========================================================
 # Гистограмма
-HIST_BINS       = 300
-PEAK_MIN_HEIGHT = 0.08
+HIST_BINS       = 400
+PEAK_MIN_HEIGHT = 0.02
 PEAK_MIN_DIST   = 20
 
-# Напряжения для финальной ВАХ
-# (оставляем только симметричные стандартные)
-TARGET_VOLTAGES = [-150, -100, -75, -50,
-                    50,   75,  100, 150]
 
 # =======================================================
 
@@ -68,6 +107,120 @@ def lowpass_filter(data: np.ndarray,
     b, a = scipy_signal.butter(4, cutoff / nyq, btype='low')
     return scipy_signal.filtfilt(b, a, data)
 
+def apply_manual_exclude(
+        intervals: pd.DataFrame,
+        file_name: str,
+        manual_exclude: Dict) -> pd.DataFrame:
+    """
+    Исключает или разбивает интервалы по ручным маскам.
+
+    Логика:
+    - Зона исключения полностью покрывает интервал
+      → интервал удаляется целиком
+
+    - Зона исключения в начале интервала
+      → обрезаем начало
+
+    - Зона исключения в конце интервала
+      → обрезаем конец
+
+    - Зона исключения внутри интервала
+      → разбиваем на два подынтервала
+
+    Короткие остатки (< MIN_DURATION_SEC) отбрасываются.
+    """
+    if file_name not in manual_exclude:
+        return intervals
+
+    exclude_zones = manual_exclude[file_name]
+    MIN_DUR = 30.0
+
+    def split_interval(t_s, t_e, voltage, row):
+        """
+        Применяет все зоны исключения к одному интервалу.
+        Возвращает список подынтервалов.
+        """
+        # Начинаем с одного интервала
+        segments = [(t_s, t_e)]
+
+        for (ex_s, ex_e) in exclude_zones:
+            new_segments = []
+            for (s, e) in segments:
+                # Зона исключения не пересекается
+                if ex_e <= s or ex_s >= e:
+                    new_segments.append((s, e))
+                    continue
+
+                # Зона полностью покрывает сегмент
+                if ex_s <= s and ex_e >= e:
+                    print(f"    исключён:  {voltage:+d} mV "
+                          f"[{s:.0f}–{e:.0f}s] "
+                          f"(покрыт маской [{ex_s}–{ex_e}])")
+                    continue
+
+                # Зона в начале
+                if ex_s <= s and ex_e < e:
+                    new_s = ex_e
+                    if e - new_s >= MIN_DUR:
+                        print(f"    обрезан:   {voltage:+d} mV "
+                              f"начало [{s:.0f}→{new_s:.0f}]")
+                        new_segments.append((new_s, e))
+                    continue
+
+                # Зона в конце
+                if ex_s > s and ex_e >= e:
+                    new_e = ex_s
+                    if new_e - s >= MIN_DUR:
+                        print(f"    обрезан:   {voltage:+d} mV "
+                              f"конец [{new_e:.0f}←{e:.0f}]")
+                        new_segments.append((s, new_e))
+                    continue
+
+                # Зона внутри — разбиваем на два
+                if ex_s > s and ex_e < e:
+                    left  = (s, ex_s)
+                    right = (ex_s, e)
+
+                    print(f"    разбит:    {voltage:+d} mV "
+                          f"[{s:.0f}–{e:.0f}s] "
+                          f"→ шум [{ex_s:.0f}–{ex_e:.0f}]")
+
+                    if left[1] - left[0] >= MIN_DUR:
+                        new_segments.append(left)
+                    else:
+                        print(f"      левая часть < {MIN_DUR}s "
+                              f"→ отброшена")
+
+                    if right[1] - right[0] >= MIN_DUR:
+                        new_segments.append(right)
+                    else:
+                        print(f"      правая часть < {MIN_DUR}s "
+                              f"→ отброшена")
+
+            segments = new_segments
+
+        return segments
+
+    rows_out = []
+
+    for _, row in intervals.iterrows():
+        t_s     = row['t_start']
+        t_e     = row['t_end']
+        voltage = int(row['voltage_mV'])
+
+        segments = split_interval(t_s, t_e, voltage, row)
+
+        for (s, e) in segments:
+            new_row            = row.copy()
+            new_row['t_start'] = round(s, 3)
+            new_row['t_end']   = round(e, 3)
+            new_row['duration']= round(e - s, 1)
+            rows_out.append(new_row)
+
+    if not rows_out:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows_out).reset_index(drop=True)
 
 def mask_noisy_segments(current: np.ndarray,
                          fs: float,
@@ -93,66 +246,68 @@ def mask_noisy_segments(current: np.ndarray,
     return mask
 
 
-def get_single_channel_current(
-        current: np.ndarray,
-        bins: int = 300,
-        peak_min_height: float = 0.08,
-        peak_min_dist: int = 20) -> Dict:
-    """
-    Два пика гистограммы → I_closed, I_open, delta_I, sem_delta.
-    """
+def get_single_channel_current(current: np.ndarray,
+                               voltage_mV: int,
+                               bins: int = 400,
+                               peak_min_height: float = 0.02,
+                               peak_min_dist: int = 20,
+                               min_step_pA: float = 0.3) -> Dict:
     hist, edges = np.histogram(current, bins=bins)
     centers = (edges[:-1] + edges[1:]) / 2.0
 
+    hist_s = gaussian_filter1d(hist.astype(float), sigma=2)
+
     peaks, _ = find_peaks(
-        hist,
-        height=hist.max() * peak_min_height,
+        hist_s,
+        height=hist_s.max() * peak_min_height,
         distance=peak_min_dist
     )
 
-    result = {
-        'I_closed':  float(np.median(current)),
-        'I_open':    np.nan,
-        'delta_I':   np.nan,
-        'sem_delta': np.nan,
-        'n_peaks':   len(peaks),
-        'hist':      (hist, centers)
+    closed_idx = int(np.argmax(hist_s))  # baseline как главный пик
+    I_closed = float(centers[closed_idx])
+
+    direction = np.sign(voltage_mV) if voltage_mV != 0 else 1.0
+
+    # кандидаты на open: в нужную сторону и не слишком близко
+    cand = []
+    for p in peaks:
+        d = centers[p] - I_closed
+        if direction * d > min_step_pA:
+            cand.append(p)
+
+    # fallback: если пик не нашёлся — берём квантиль (редкие открытия)
+    if len(cand) == 0:
+        q = 0.995 if direction > 0 else 0.005
+        I_open = float(np.quantile(current, q))
+        return {
+            "I_closed": I_closed,
+            "I_open": I_open,
+            "delta_I": float(I_open - I_closed),
+            "sem_delta": np.nan,
+            "n_peaks": int(len(peaks)),
+            "hist": (hist_s, centers),
+        }
+
+    # выбираем ближайший open-пик (одноканальный), а не мультиканальный
+    cand = np.array(cand, dtype=int)
+    chosen = cand[np.argmin(np.abs(centers[cand] - I_closed))]
+    I_open = float(centers[chosen])
+
+    return {
+        "I_closed": I_closed,
+        "I_open": I_open,
+        "delta_I": float(I_open - I_closed),   # со знаком
+        "sem_delta": np.nan,
+        "n_peaks": int(len(peaks)),
+        "hist": (hist_s, centers),
     }
-
-    if len(peaks) < 2:
-        return result
-
-    # Два самых высоких пика
-    top2 = peaks[np.argsort(hist[peaks])[::-1][:2]]
-    top2 = top2[np.argsort(centers[top2])]
-
-    result['I_closed'] = float(centers[top2[0]])
-    result['I_open']   = float(centers[top2[1]])
-    result['delta_I']  = float(
-        abs(result['I_open'] - result['I_closed'])
-    )
-
-    # Погрешность через FWHM → σ
-    def peak_sigma(idx: int) -> float:
-        h_half = hist[idx] / 2.0
-        l, r = idx, idx
-        while l > 0 and hist[l] > h_half:
-            l -= 1
-        while r < len(hist) - 1 and hist[r] > h_half:
-            r += 1
-        return (centers[r] - centers[l]) / 2.355
-
-    result['sem_delta'] = float(np.sqrt(
-        peak_sigma(top2[0])**2 + peak_sigma(top2[1])**2
-    ))
-
-    return result
 
 
 def analyze_interval(abf: pyabf.ABF,
                      t_start: float,
                      t_end: float,
-                     voltage_mV: int) -> Optional[Dict]:
+                     voltage_mV: int,
+                     is_control: bool = False) -> Optional[Dict]:
     """
     Анализ одного временного интервала.
     """
@@ -181,18 +336,44 @@ def analyze_interval(abf: pyabf.ABF,
     )
     current_clean = current[noise_mask]
 
+
+
     if len(current_clean) < 200:
         print(f"      ⚠️  мало точек после маски: "
               f"{len(current_clean)}")
         return None
+        
+    if is_control:
+        I_cl = float(np.median(current_clean))
+        mad = 1.4826 * np.median(np.abs(current_clean - np.median(current_clean)))  # робастный шум
+    
+        print(f"      CONTROL {voltage_mV:+5d} mV  "
+              f"[{t_start:.0f}–{t_end:.0f}s]  "
+              f"I_cl={I_cl:.2f} pA  noise(MAD)={mad:.2f} pA")
+    
+        return {
+            'voltage_mV': voltage_mV,
+            't_start': t_start,
+            't_end': t_end,
+            'duration': t_end - t_start,
+            'I_closed': I_cl,
+            'I_open': np.nan,
+            'delta_I': 0.0,
+            'sem_delta': float(mad),
+            'n_peaks': 1,
+            'n_points': len(current_clean),
+            'hist': (None, None),
+            'current': current_clean
+        }
 
     # Гистограмма → delta_I
     res = get_single_channel_current(
-        current_clean,
-        bins=HIST_BINS,
-        peak_min_height=PEAK_MIN_HEIGHT,
-        peak_min_dist=PEAK_MIN_DIST
-    )
+    current_clean,
+    voltage_mV,
+    bins=HIST_BINS,
+    peak_min_height=PEAK_MIN_HEIGHT,
+    peak_min_dist=PEAK_MIN_DIST
+)
 
     print(f"      {voltage_mV:+5d} mV  "
           f"[{t_start:.0f}–{t_end:.0f}s]  "
@@ -232,15 +413,27 @@ def analyze_file(path: str,
     intervals = get_voltage_intervals(
         path,
         min_duration_sec=MIN_DURATION_SEC,
-        skip_zero=SKIP_ZERO
+        skip_zero=SKIP_ZERO,
+        target_voltages=TARGET_VOLTAGES
     )
 
     if intervals.empty:
         print("  Нет подходящих интервалов")
         return pd.DataFrame()
 
-    abf = pyabf.ABF(path)
-    results = []
+    # Применяем ручные маски
+    intervals = apply_manual_exclude(
+        intervals,
+        name,
+        MANUAL_EXCLUDE
+    )
+
+    if intervals.empty:
+        print("  Все интервалы исключены вручную")
+        return pd.DataFrame()
+
+    abf       = pyabf.ABF(path)
+    results   = []
     hist_data = []
 
     for _, row in intervals.iterrows():
@@ -248,12 +441,13 @@ def analyze_file(path: str,
             abf,
             row['t_start'],
             row['t_end'],
-            int(row['voltage_mV'])
+            int(row['voltage_mV']),
+            is_control=is_control
         )
         if res is None:
             continue
 
-        res['file'] = name
+        res['file']       = name
         res['is_control'] = is_control
         hist_data.append(res)
 
@@ -262,12 +456,10 @@ def analyze_file(path: str,
             if k not in ('hist', 'current')
         })
 
-    # Диагностические графики (только для эксперимента)
     if hist_data and not is_control:
         plot_diagnostics(hist_data, name)
 
     return pd.DataFrame(results)
-
 
 def plot_diagnostics(results: List[Dict],
                      file_name: str) -> None:
@@ -420,9 +612,9 @@ def build_iv(exp_df: pd.DataFrame,
     # Проводимость
     mask_nonzero = summary['voltage_mV'] != 0
     summary.loc[mask_nonzero, 'conductance_pS'] = (
-        summary.loc[mask_nonzero, 'corrected_dI'] /
-        summary.loc[mask_nonzero, 'voltage_mV'].abs() * 1000
-    )
+        1000 * summary.loc[mask_nonzero, 'corrected_dI'] /
+        summary.loc[mask_nonzero, 'voltage_mV']
+    ).abs()
 
     return summary
 
