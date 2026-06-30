@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Интерактивный просмотр gap-free записей.
 
@@ -24,7 +23,7 @@ FILE = "data/raw/26629000.abf"
 # итого ~600к точек → нормально
 DECIMATE = 25
 
-# Целевые напряжения (остальные теги не показываем)
+# Целевые напряжения
 TARGET_VOLTAGES = {-150, -100, -50, 50, 100, 150}
 
 # Цвета для разных напряжений
@@ -115,8 +114,7 @@ def browse_file(path: str) -> None:
     ax.set_ylabel("Ток (pA)", fontsize=12)
     ax.set_title(
         f"{name}  |  {duration:.0f} сек  |  "
-        f"{abf.dataRate} Гц\n"
-        f"Используй zoom чтобы найти где начались каналы",
+        f"{abf.dataRate} Гц\n",
         fontsize=12
     )
     ax.grid(True, alpha=0.2)
@@ -136,6 +134,6 @@ def browse_file(path: str) -> None:
 if __name__ == "__main__":
     browse_file(FILE)
     print("\nЧТО ДЕЛАТЬ:")
-    print("2. Найди где начались ступеньки (каналы)")
-    print("3. Запиши время начала каналов для каждого напряжения")
-    print("4. Перенеси в MANUAL_EXCLUDE в gapfree_iv_analysis.py")
+    print("1. Найди где начались ступеньки (каналы)")
+    print("2. Запиши время начала каналов для каждого напряжения")
+    print("3. Перенеси в MANUAL_EXCLUDE в gapfree_iv_analysis.py")
