@@ -10,3 +10,13 @@ data/raw/
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
+
+# MD files
+*.gro
+*.trr
+*.edr
+*.log
+*.tpr
+*.cpt
+data/md_test/
