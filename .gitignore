@@ -6,3 +6,7 @@ data/md_test/
 *.abf
 data/raw/
 *.csv
+# Игнорирование папок __pycache__ и скомпилированных файлов Python
+__pycache__/
+*.py[cod]
+*$py.class
