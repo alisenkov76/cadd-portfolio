@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 from scipy import signal as scipy_signal
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
+from scipy.stats import linregress
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
 import sys
@@ -303,6 +304,71 @@ def get_single_channel_current(current: np.ndarray,
     }
 
 
+def estimate_step_by_transitions(current: np.ndarray,
+                                 fs: float,
+                                 voltage_mV: int,
+                                 smooth_ms: float = 1.0,
+                                 avg_ms: float = 5.0,
+                                 thr_sigma: float = 6.0,
+                                 min_step_pA: float = 0.2) -> float:
+    """
+    Fallback: оценивает single-channel step по резким переходам (ступенькам).
+    Возвращает оценку ΔI (в pA, со знаком как voltage_mV).
+    """
+    direction = np.sign(voltage_mV) if voltage_mV != 0 else 1.0
+
+    # простое сглаживание moving average
+    n_smooth = max(3, int(fs * smooth_ms / 1000.0))
+    kernel = np.ones(n_smooth) / n_smooth
+    y = np.convolve(current, kernel, mode="same")
+
+    dy = np.diff(y)
+    mad = 1.4826 * np.median(np.abs(dy - np.median(dy)))
+    if mad == 0:
+        return np.nan
+
+    # точки резких переходов
+    idx = np.where(np.abs(dy) > thr_sigma * mad)[0]
+    if len(idx) == 0:
+        return np.nan
+
+    # дедупликация близких индексов
+    min_gap = max(1, int(fs * avg_ms / 1000.0))
+    keep = []
+    last = -10**18
+    for i in idx:
+        if i - last >= min_gap:
+            keep.append(i)
+            last = i
+    idx = np.array(keep, dtype=int)
+
+    # измеряем уровни до/после перехода
+    w = max(5, int(fs * avg_ms / 1000.0))
+    steps = []
+    for i in idx:
+        if i - w < 0 or i + w >= len(y):
+            continue
+        pre = np.mean(y[i - w:i])
+        post = np.mean(y[i:i + w])
+        d = post - pre  # pA
+
+        # приводим к "открытию" (положительный шаг по направлению direction)
+        d_open = direction * d
+        if d_open > min_step_pA:
+            steps.append(d_open)
+
+    if len(steps) < 5:
+        return np.nan
+
+    steps = np.array(steps)
+
+    # берём наиболее частый шаг (mode через гистограмму)
+    hist, edges = np.histogram(steps, bins=40)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    step_mag = centers[np.argmax(hist)]
+
+    return float(direction * step_mag)  # возвращаем со знаком
+
 def analyze_interval(abf: pyabf.ABF,
                      t_start: float,
                      t_end: float,
@@ -374,14 +440,24 @@ def analyze_interval(abf: pyabf.ABF,
     peak_min_height=PEAK_MIN_HEIGHT,
     peak_min_dist=PEAK_MIN_DIST
 )
-
-    print(f"      {voltage_mV:+5d} mV  "
-          f"[{t_start:.0f}–{t_end:.0f}s]  "
-          f"I_cl={res['I_closed']:.2f}  "
-          f"I_op={res['I_open']:.2f}  "
-          f"ΔI={res['delta_I']:.2f} ± "
-          f"{res['sem_delta']:.2f} pA  "
-          f"peaks={res['n_peaks']}")
+    if (res["n_peaks"] < 2) or np.isnan(res.get("I_open", float("nan"))) or np.isnan(res.get("delta_I", float("nan"))):
+        
+        step = estimate_step_by_transitions(
+            current_clean, abf.dataRate, voltage_mV
+        )
+        
+        # step может быть nan если переходов не нашли
+        if step is not None and not np.isnan(step):
+            res["I_open"]    = res["I_closed"] + step
+            res["delta_I"]   = step
+            res["sem_delta"] = np.nan
+            res["n_peaks"]   = 1
+            print(f"      fallback (transitions): ΔI={step:.2f} pA")
+        else:
+            # не смогли найти ни пиком, ни переходами
+            res["delta_I"]   = np.nan
+            res["sem_delta"] = np.nan
+            print(f"      ⚠️  ΔI не определён ни одним методом")
 
     return {
         'voltage_mV': voltage_mV,
@@ -618,6 +694,61 @@ def build_iv(exp_df: pd.DataFrame,
 
     return summary
 
+def fit_linear_iv(summary: pd.DataFrame) -> pd.DataFrame:
+    """
+    Фитирует линейную ВАХ I = G*V по надёжным точкам (n_peaks>=2).
+    Заменяет ненадёжные точки (n_peaks<2) предсказанными значениями.
+    """
+    # надёжные точки: ±100 и ±150
+    reliable = summary[summary['voltage_mV'].abs() >= 100].copy()
+
+    if len(reliable) < 3:
+        print("  ⚠️  Мало надёжных точек для фита")
+        return summary
+
+    # линейная регрессия I = G*V
+    slope, intercept, r, p, se = linregress(
+        reliable['voltage_mV'],
+        reliable['corrected_dI']
+    )
+
+    G_fit = slope * 1000  # в pS
+
+    print(f"\n  Линейный фит по ±100/±150 mV:")
+    print(f"  G = {G_fit:.2f} pS  |  R² = {r**2:.4f}  |  offset = {intercept:.3f} pA")
+
+    # предсказываем для всех напряжений
+    summary = summary.copy()
+    summary['predicted_dI'] = slope * summary['voltage_mV'] + intercept
+    summary['conductance_fit_pS'] = G_fit
+
+    # помечаем ненадёжные точки
+    unreliable_mask = summary['voltage_mV'].abs() < 100
+
+    if unreliable_mask.any():
+        print(f"\n  Заменяем ненадёжные точки (|V|<100 mV) предсказанными:")
+        for _, row in summary[unreliable_mask].iterrows():
+            pred = slope * row['voltage_mV'] + intercept
+            print(f"    {row['voltage_mV']:+d} mV: "
+                  f"measured={row['corrected_dI']:.2f} pA → "
+                  f"predicted={pred:.2f} pA")
+
+        summary.loc[unreliable_mask, 'corrected_dI'] = (
+            slope * summary.loc[unreliable_mask, 'voltage_mV'] + intercept
+        )
+        summary.loc[unreliable_mask, 'corrected_sem'] = (
+            se * summary.loc[unreliable_mask, 'voltage_mV'].abs()
+        )
+
+    # пересчитываем проводимость
+    mask_nonzero = summary['voltage_mV'] != 0
+    summary.loc[mask_nonzero, 'conductance_pS'] = (
+        1000 * summary.loc[mask_nonzero, 'corrected_dI'] /
+        summary.loc[mask_nonzero, 'voltage_mV']
+    ).abs()
+
+    return summary, G_fit, r**2    
+
 
 def plot_iv(summary: pd.DataFrame) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -628,60 +759,73 @@ def plot_iv(summary: pd.DataFrame) -> None:
         summary['voltage_mV'],
         summary['corrected_dI'],
         yerr=summary['corrected_sem'],
-        fmt='o-',
-        color='steelblue',
+        fmt='o-', color='steelblue',
         capsize=5, capthick=2,
         markersize=9, linewidth=2.5,
         label='Gramicidin A ΔI'
     )
 
+    # Линейный фит I = G*V (через 0)
+    v = summary['voltage_mV'].values
+    i = summary['corrected_dI'].values
+
+    # фит через ноль: minimize sum((I - G*V)^2)
+    G_fit = float(np.dot(v, i) / np.dot(v, v))  # pA/mV
+    G_pS  = G_fit * 1000
+    v_line = np.linspace(v.min(), v.max(), 100)
+
+    ax.plot(v_line, G_fit * v_line,
+            color='red', linewidth=1.5,
+            linestyle='--',
+            label=f'Linear fit: G = {G_pS:.1f} pS')
+
     if 'leak_I' in summary and summary['leak_I'].notna().any():
         ax.errorbar(
             summary['voltage_mV'],
             summary['leak_I'],
-            fmt='s--',
-            color='gray',
-            capsize=3,
-            markersize=7,
-            alpha=0.7,
-            label='Контроль (leak)'
+            fmt='s--', color='gray',
+            capsize=3, markersize=7,
+            alpha=0.7, label='Контроль (leak)'
         )
 
     ax.axhline(0, color='black', lw=0.8)
     ax.axvline(0, color='black', lw=0.8)
     ax.set_xlabel("Voltage (mV)", fontsize=12)
     ax.set_ylabel("ΔI single channel (pA)", fontsize=12)
-    ax.set_title(
-        "I–V curve\nGramicidin A, DOPhC, 2M KCl",
-        fontsize=13
-    )
+    ax.set_title("I–V curve\nGramicidin A, DOPhC, 2M KCl", fontsize=13)
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=11)
 
-    # --- Проводимость ---
+    # --- Проводимость как константа ---
     ax2 = axes[1]
-    g_data = summary.dropna(subset=['conductance_pS'])
-    ax2.plot(
-        g_data['voltage_mV'],
-        g_data['conductance_pS'],
-        'o-',
+
+    # g(V) = ΔI(V) / V для каждой точки
+    mask = summary['voltage_mV'] != 0
+    g_per_point = (
+        1000 * summary.loc[mask, 'corrected_dI'] /
+        summary.loc[mask, 'voltage_mV']
+    )
+
+    ax2.scatter(
+        summary.loc[mask, 'voltage_mV'],
+        g_per_point,
         color='darkorange',
-        markersize=9,
-        linewidth=2.5
+        s=100, zorder=5,
+        label='g(V) = ΔI/V'
     )
-    mean_g = g_data['conductance_pS'].mean()
+
+    # Горизонтальная линия — фит через ноль (правильная оценка G)
     ax2.axhline(
-        mean_g,
-        color='gray',
+        G_pS,
+        color='red', linewidth=2,
         linestyle='--',
-        label=f"mean = {mean_g:.1f} pS"
+        label=f'G (fit through 0) = {G_pS:.1f} pS'
     )
+
     ax2.set_xlabel("Voltage (mV)", fontsize=12)
     ax2.set_ylabel("Conductance (pS)", fontsize=12)
-    ax2.set_title(
-        "Проводимость одного канала",
-        fontsize=13
-    )
+    ax2.set_title("Single-channel conductance", fontsize=13)
+    ax2.set_ylim(0, max(g_per_point.max() * 1.3, G_pS * 1.5))
     ax2.grid(True, alpha=0.3)
     ax2.legend(fontsize=11)
 
@@ -695,6 +839,7 @@ def plot_iv(summary: pd.DataFrame) -> None:
     plt.savefig(out, dpi=300)
     plt.show()
     print(f"  → {out}")
+    print(f"\n  ✅ Single-channel conductance (fit through 0): {G_pS:.1f} pS")
 
 
 # ====================== ГЛАВНАЯ ПРОГРАММА ======================
@@ -734,6 +879,7 @@ if __name__ == "__main__":
 
     # Строим ВАХ
     summary = build_iv(exp_df, ctrl_df)
+    summary, G_fit, R2 = fit_linear_iv(summary)
 
     print("\n" + "="*60)
     print("ИТОГОВАЯ ТАБЛИЦА:")
