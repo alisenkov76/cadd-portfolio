@@ -13,6 +13,7 @@ import pyabf
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from typing import Tuple
 from scipy import signal as scipy_signal
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
@@ -179,7 +180,7 @@ def apply_manual_exclude(
                 # Зона внутри — разбиваем на два
                 if ex_s > s and ex_e < e:
                     left  = (s, ex_s)
-                    right = (ex_s, e)
+                    right = (ex_e, e)
 
                     print(f"    разбит:    {voltage:+d} mV "
                           f"[{s:.0f}–{e:.0f}s] "
@@ -214,7 +215,7 @@ def apply_manual_exclude(
             new_row            = row.copy()
             new_row['t_start'] = round(s, 3)
             new_row['t_end']   = round(e, 3)
-            new_row['duration']= round(e - s, 1)
+            new_row['duration_sec']= round(e - s, 1)
             rows_out.append(new_row)
 
     if not rows_out:
@@ -302,7 +303,28 @@ def get_single_channel_current(current: np.ndarray,
         "hist": (hist_s, centers),
     }
 
+def quantize_open_channels(current: np.ndarray,
+                           I_closed: float,
+                           delta_I: float,
+                           max_channels: int = 6) -> np.ndarray:
+    """
+    Квантование тока в число открытых каналов 0,1,2,...
 
+    current   : очищенный ток (pA)
+    I_closed  : уровень закрытого состояния (pA)
+    delta_I   : шаг 1 канала (pA), со знаком
+    """
+    if delta_I is None or np.isnan(delta_I) or delta_I == 0:
+        return np.zeros(len(current), dtype=int)
+
+    step = abs(delta_I)
+    direction = np.sign(delta_I)
+
+    proj = (current - I_closed) * direction
+    n = np.floor((proj + 0.5 * step) / step).astype(int)
+    n = np.clip(n, 0, max_channels)
+    return n
+    
 def estimate_step_by_transitions(current: np.ndarray,
                                  fs: float,
                                  voltage_mV: int,
@@ -416,14 +438,15 @@ def analyze_interval(abf: pyabf.ABF,
               f"[{t_start:.0f}–{t_end:.0f}s]  "
               f"I_cl={I_cl:.2f} pA  noise(MAD)={mad:.2f} pA")
     
+    
         return {
             'voltage_mV': voltage_mV,
             't_start': t_start,
             't_end': t_end,
-            'duration': t_end - t_start,
+            'duration_sec': t_end - t_start,
             'I_closed': I_cl,
             'I_open': np.nan,
-            'delta_I': 0.0,
+            'delta_I': I_cl,          # абсолютный ток как "delta"
             'sem_delta': float(mad),
             'n_peaks': 1,
             'n_points': len(current_clean),
@@ -458,19 +481,57 @@ def analyze_interval(abf: pyabf.ABF,
             res["sem_delta"] = np.nan
             print(f"      ⚠️  ΔI не определён ни одним методом")
 
+    # ========= occupancy ==========
+    delta_I_val = res["delta_I"]
+
+    if delta_I_val is None or (
+        isinstance(delta_I_val, float) and np.isnan(delta_I_val)
+    ):
+        # ΔI не определён — occupancy неизвестен
+        Nmax         = None
+        Nmean        = None
+        Popen        = None
+        open_events  = None
+        events_per_s = None
+        print(f"      occupancy: ΔI=NaN → пропуск")
+    else:
+        n_open = quantize_open_channels(
+            current_clean,
+            I_closed=res["I_closed"],
+            delta_I=delta_I_val,
+            max_channels=6
+        )
+        Nmax         = int(n_open.max())
+        Nmean        = float(n_open.mean())
+        Popen        = float((n_open >= 1).mean())
+        open_events  = int(
+            np.sum((n_open[:-1] == 0) & (n_open[1:] > 0))
+        )
+        events_per_s = float(open_events / (t_end - t_start))
+
+        print(f"      occupancy: Nmax={Nmax}  "
+              f"Popen={Popen:.3f}  "
+              f"events/s={events_per_s:.2f}")
+
+
     return {
-        'voltage_mV': voltage_mV,
-        't_start':    t_start,
-        't_end':      t_end,
-        'duration':   t_end - t_start,
-        'I_closed':   res['I_closed'],
-        'I_open':     res['I_open'],
-        'delta_I':    res['delta_I'],
-        'sem_delta':  res['sem_delta'],
-        'n_peaks':    res['n_peaks'],
-        'n_points':   len(current_clean),
-        'hist':       res['hist'],
-        'current':    current_clean
+        'voltage_mV':   voltage_mV,
+        't_start':      t_start,
+        't_end':        t_end,
+        'duration_sec': t_end - t_start,   # ← называем duration_sec сразу
+        'I_closed':     res['I_closed'],
+        'I_open':       res['I_open'],
+        'delta_I':      res['delta_I'],
+        'sem_delta':    res['sem_delta'],
+        'n_peaks':      res['n_peaks'],
+        'n_points':     len(current_clean),
+        'Nmax':         Nmax,
+        'Nmean':        Nmean,
+        'Popen':        Popen,
+        'open_events':  open_events,
+        'events_per_s': events_per_s,
+        'hist':         res['hist'],
+        'current':      current_clean,
     }
 
 
@@ -635,119 +696,142 @@ def pooled_sem(sems: np.ndarray,
 def build_iv(exp_df: pd.DataFrame,
              ctrl_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Усредняет по напряжению, корректирует на контроль,
-    считает проводимость.
+    Усреднение single-channel ΔI по напряжению + проводимость.
+
+    ВАЖНО:
+    ΔI = I_open - I_closed уже убирает baseline/offset внутри интервала,
+    поэтому контроль НЕ вычитаем. Контроль добавляем только для справки.
     """
     rows = []
-    for voltage, grp in exp_df.groupby('voltage_mV'):
-        mean_dI = grp['delta_I'].mean()
-        p_sem   = pooled_sem(
-            grp['sem_delta'].values,
-            grp['n_points'].values
+
+    # защитимся от кривых строк
+    exp = exp_df.dropna(subset=["delta_I", "voltage_mV"]).copy()
+    exp = exp[exp["voltage_mV"] != 0]
+
+    for voltage, grp0 in exp.groupby("voltage_mV"):
+        grp = grp0.copy()
+
+        # веса = число точек (пропорционально длительности)
+        w = grp["n_points"].astype(float).values
+        y = grp["delta_I"].astype(float).values
+
+        mean_dI_w = float(np.average(y, weights=w))
+
+        # pooled SEM по интервалам (то что у тебя уже было)
+        p_sem = pooled_sem(
+            sems=grp["sem_delta"].astype(float).fillna(0).values,
+            ns=grp["n_points"].astype(float).values
         )
+
+        total_sec = float(grp["duration_sec"].sum()) if "duration_sec" in grp.columns else float("nan")
+
         rows.append({
-            'voltage_mV':  voltage,
-            'mean_delta_I': mean_dI,
-            'pooled_sem':   p_sem,
-            'n_intervals':  len(grp),
-            'files':        ', '.join(grp['file'].unique())
+            "voltage_mV": int(voltage),
+            "mean_delta_I": mean_dI_w,
+            "pooled_sem": float(p_sem),
+            "corrected_dI": mean_dI_w,
+            "corrected_sem": float(p_sem),
+            "n_intervals": int(len(grp)),
+            "n_files": int(grp["file"].nunique()),
+            "total_sec": total_sec,
+            "files": ", ".join(grp["file"].unique()),
         })
 
-    summary = pd.DataFrame(rows).sort_values('voltage_mV')
+    summary = pd.DataFrame(rows).sort_values("voltage_mV").reset_index(drop=True)
 
-    # Коррекция на контроль
-    if not ctrl_df.empty:
+    # Контроль — только baseline I (для справочного оверлея)
+    if ctrl_df is not None and not ctrl_df.empty:
         ctrl_mean = (
-            ctrl_df.groupby('voltage_mV')
+            ctrl_df.groupby("voltage_mV")
             .agg(
-                leak_I=('delta_I', 'mean'),
-                leak_sem=('sem_delta',
-                          lambda x: float(
-                              np.sqrt(np.mean(x**2))
-                          ))
+                control_I=("I_closed", "mean"),
+                control_noise=("sem_delta", lambda x: float(np.sqrt(np.mean(np.asarray(x, dtype=float)**2))))
             )
             .reset_index()
         )
-        summary = summary.merge(
-            ctrl_mean, on='voltage_mV', how='left'
-        )
-        summary['corrected_dI'] = (
-            summary['mean_delta_I'] -
-            summary['leak_I'].fillna(0)
-        )
-        summary['corrected_sem'] = np.sqrt(
-            summary['pooled_sem']**2 +
-            summary['leak_sem'].fillna(0)**2
-        )
-    else:
-        summary['corrected_dI']  = summary['mean_delta_I']
-        summary['corrected_sem'] = summary['pooled_sem']
-        summary['leak_I']        = np.nan
+        summary = summary.merge(ctrl_mean, on="voltage_mV", how="left")
 
-    # Проводимость
-    mask_nonzero = summary['voltage_mV'] != 0
-    summary.loc[mask_nonzero, 'conductance_pS'] = (
-        1000 * summary.loc[mask_nonzero, 'corrected_dI'] /
-        summary.loc[mask_nonzero, 'voltage_mV']
-    ).abs()
+    # conductance
+    v = summary["voltage_mV"].astype(float)
+    summary["conductance_pS"] = (1000.0 * summary["corrected_dI"].astype(float) / v).abs()
+
+    # QC-флаг: короткие точки (типа твоего -150 mV = 72 сек)
+    summary["qc_short"] = summary["total_sec"] < 200.0
 
     return summary
 
-def fit_linear_iv(summary: pd.DataFrame) -> pd.DataFrame:
+def fit_linear_iv(summary: pd.DataFrame) -> Tuple[pd.DataFrame, float, float]:
     """
-    Фитирует линейную ВАХ I = G*V по надёжным точкам (n_peaks>=2).
-    Заменяет ненадёжные точки (n_peaks<2) предсказанными значениями.
+    Фитирует линейную ВАХ I = slope0 * V (через 0) по надёжным точкам (|V|>=100 mV).
+    Заменяет ненадёжные точки (|V|<100 mV) предсказанными значениями.
+    Возвращает: (summary, G_fit_pS, R2)
     """
-    # надёжные точки: ±100 и ±150
-    reliable = summary[summary['voltage_mV'].abs() >= 100].copy()
+    reliable = summary[
+    (summary["voltage_mV"].abs() >= 100) &
+    (~summary.get("qc_short", False))
+    ].copy()
 
     if len(reliable) < 3:
         print("  ⚠️  Мало надёжных точек для фита")
-        return summary
+        return summary, float("nan"), float("nan")
 
-    # линейная регрессия I = G*V
-    slope, intercept, r, p, se = linregress(
-        reliable['voltage_mV'],
-        reliable['corrected_dI']
-    )
+    v = reliable["voltage_mV"].astype(float).values
+    i = reliable["corrected_dI"].astype(float).values
 
-    G_fit = slope * 1000  # в pS
+    # ---- fit through 0: slope0 = (v·i)/(v·v) ----
+    slope0 = float((v @ i) / (v @ v))   # pA/mV
+    G_fit_pS = slope0 * 1000.0          # pS
 
-    print(f"\n  Линейный фит по ±100/±150 mV:")
-    print(f"  G = {G_fit:.2f} pS  |  R² = {r**2:.4f}  |  offset = {intercept:.3f} pA")
+    # ---- оценка ошибки slope0 ----
+    resid = i - slope0 * v
+    RSS = float(np.sum(resid**2))
+    dof = max(1, len(v) - 1)            # 1 параметр => n-1
+    sigma2 = RSS / dof
+    se_slope0 = float(np.sqrt(sigma2 / np.sum(v**2)))  # pA/mV
 
-    # предсказываем для всех напряжений
+    # ---- R2 для through-0 (объяснённая доля энергии сигнала) ----
+    # здесь TSS = sum(i^2) (поскольку модель без свободного члена)
+    TSS = float(np.sum(i**2))
+    R2 = 1.0 - (RSS / TSS) if TSS > 0 else float("nan")
+
+    print(f"\n  Линейный фит через 0 по ±100/±150 mV:")
+    print(f"  G = {G_fit_pS:.2f} pS  |  R² = {R2:.4f}")
+
     summary = summary.copy()
-    summary['predicted_dI'] = slope * summary['voltage_mV'] + intercept
-    summary['conductance_fit_pS'] = G_fit
+    summary["predicted_dI"] = slope0 * summary["voltage_mV"].astype(float)
+    summary["conductance_fit_pS"] = G_fit_pS
 
-    # помечаем ненадёжные точки
-    unreliable_mask = summary['voltage_mV'].abs() < 100
+    summary = summary.copy()
+    summary["corrected_dI_meas"]  = summary["corrected_dI"]
+    summary["corrected_sem_meas"] = summary["corrected_sem"]
+    summary["is_predicted"] = False
 
+    # ---- заменяем |V|<100 ----
+    unreliable_mask = summary["voltage_mV"].abs() < 100
     if unreliable_mask.any():
         print(f"\n  Заменяем ненадёжные точки (|V|<100 mV) предсказанными:")
         for _, row in summary[unreliable_mask].iterrows():
-            pred = slope * row['voltage_mV'] + intercept
-            print(f"    {row['voltage_mV']:+d} mV: "
-                  f"measured={row['corrected_dI']:.2f} pA → "
-                  f"predicted={pred:.2f} pA")
+            pred = slope0 * float(row["voltage_mV"])
+            print(f"    {int(row['voltage_mV']):+d} mV: "
+                  f"measured={row['corrected_dI']:.2f} pA → predicted={pred:.2f} pA")
 
-        summary.loc[unreliable_mask, 'corrected_dI'] = (
-            slope * summary.loc[unreliable_mask, 'voltage_mV'] + intercept
+        summary.loc[unreliable_mask, "corrected_dI"] = (
+            slope0 * summary.loc[unreliable_mask, "voltage_mV"].astype(float)
         )
-        summary.loc[unreliable_mask, 'corrected_sem'] = (
-            se * summary.loc[unreliable_mask, 'voltage_mV'].abs()
+        # ошибка предсказания ~ se_slope0 * |V|
+        summary.loc[unreliable_mask, "corrected_sem"] = (
+            se_slope0 * summary.loc[unreliable_mask, "voltage_mV"].abs().astype(float)
         )
+        summary.loc[unreliable_mask, "is_predicted"] = True
 
-    # пересчитываем проводимость
-    mask_nonzero = summary['voltage_mV'] != 0
-    summary.loc[mask_nonzero, 'conductance_pS'] = (
-        1000 * summary.loc[mask_nonzero, 'corrected_dI'] /
-        summary.loc[mask_nonzero, 'voltage_mV']
+    # пересчитываем g
+    mask_nonzero = summary["voltage_mV"] != 0
+    summary.loc[mask_nonzero, "conductance_pS"] = (
+        1000.0 * summary.loc[mask_nonzero, "corrected_dI"].astype(float) /
+        summary.loc[mask_nonzero, "voltage_mV"].astype(float)
     ).abs()
 
-    return summary, G_fit, r**2    
-
+    return summary, G_fit_pS, R2
 
 def plot_iv(summary: pd.DataFrame) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -778,13 +862,14 @@ def plot_iv(summary: pd.DataFrame) -> None:
             linestyle='--',
             label=f'Linear fit: G = {G_pS:.1f} pS')
 
-    if 'leak_I' in summary and summary['leak_I'].notna().any():
-        ax.errorbar(
-            summary['voltage_mV'],
-            summary['leak_I'],
-            fmt='s--', color='gray',
-            capsize=3, markersize=7,
-            alpha=0.7, label='Контроль (leak)'
+    if "control_I" in summary.columns and summary["control_I"].notna().any():
+        ax.plot(
+            summary["voltage_mV"],
+            summary["control_I"],
+            "s--",
+            color="gray",
+            alpha=0.7,
+            label="Контроль (baseline I)"
         )
 
     ax.axhline(0, color='black', lw=0.8)
@@ -840,6 +925,116 @@ def plot_iv(summary: pd.DataFrame) -> None:
     print(f"  → {out}")
     print(f"\n  ✅ Single-channel conductance (fit through 0): {G_pS:.1f} pS")
 
+def plot_g_vs_v(summary: pd.DataFrame, G_fit_pS: float | None = None) -> None:
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from pathlib import Path
+
+    s = summary.copy()
+    s = s[s["voltage_mV"] != 0].copy()
+    v = s["voltage_mV"].astype(float)
+
+    # --- measured g (до подмены) ---
+    if "corrected_dI_meas" in s.columns:
+        g_meas = (1000.0 * s["corrected_dI_meas"].astype(float) / v).abs()
+    else:
+        g_meas = (1000.0 * s["corrected_dI"].astype(float) / v).abs()
+
+    # --- used g (после подмены) ---
+    g_used = (1000.0 * s["corrected_dI"].astype(float) / v).abs()
+    g_used_sem = 1000.0 * s["corrected_sem"].astype(float) / v.abs()
+
+    qc_short = s["qc_short"].fillna(False) if "qc_short" in s.columns else np.zeros(len(s), dtype=bool)
+    is_pred = s["is_predicted"].fillna(False) if "is_predicted" in s.columns else np.zeros(len(s), dtype=bool)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # measured: маленькие серые точки (как QC reference)
+    ax.scatter(v, g_meas, s=60, color="gray", alpha=0.6, label="g_measured (raw)")
+
+    # used (final): predicted отмечаем пустыми кружками
+    mask_measured = ~is_pred
+    mask_pred = is_pred
+
+    ax.errorbar(v[mask_measured], g_used[mask_measured], yerr=g_used_sem[mask_measured],
+                fmt="o", color="darkorange", capsize=5, markersize=9, linewidth=2,
+                label="g_used (measured)")
+
+    ax.errorbar(v[mask_pred], g_used[mask_pred], yerr=g_used_sem[mask_pred],
+                fmt="o", mfc="white", mec="darkorange", color="darkorange",
+                capsize=5, markersize=9, linewidth=2,
+                label="g_used (predicted for |V|<100)")
+
+    # QC-short: обводка/маркер X поверх
+    if qc_short.any():
+        ax.scatter(v[qc_short], g_used[qc_short], marker="x", s=120, color="black", label="QC short")
+
+    if G_fit_pS is not None and np.isfinite(G_fit_pS):
+        ax.axhline(G_fit_pS, color="red", linestyle="--", linewidth=2,
+                   label=f"G (linear fit) = {G_fit_pS:.2f} pS")
+
+    ax.set_xlabel("Voltage (mV)", fontsize=12)
+    ax.set_ylabel("Conductance (pS)", fontsize=12)
+    ax.set_title("Gramicidin A — g(V)", fontsize=13)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+
+    Path("results").mkdir(exist_ok=True)
+    out = Path("results") / "g_vs_v.png"
+    plt.tight_layout()
+    plt.savefig(out, dpi=300)
+    plt.show()
+    print(f"  → {out}")
+    
+def plot_g_absV(summary: pd.DataFrame, G_fit_pS: float | None = None) -> None:
+    """
+    График g(|V|): усредняем проводимость для +V и -V.
+    """
+    tmp = summary[summary["voltage_mV"] != 0].copy()
+    tmp["absV"] = tmp["voltage_mV"].abs().astype(int)
+    
+    # проводимость по каждой точке
+    tmp["g"] = (1000 * tmp["corrected_dI"] / tmp["voltage_mV"]).abs()
+    
+    # усреднение по |V|: mean и SEM из разброса g
+    g_abs = (
+        tmp.groupby("absV")["g"]
+        .agg(g_mean="mean", g_std="std", n="count")
+        .reset_index()
+        .sort_values("absV")
+    )
+    
+    g_abs["g_sem"] = g_abs["g_std"] / np.sqrt(g_abs["n"])
+    g_abs.loc[g_abs["n"] == 1, "g_sem"] = 0.0
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.errorbar(
+        g_abs["absV"], g_abs["g_mean"], yerr=g_abs["g_sem"],
+        fmt="o-", color="darkorange",
+        capsize=5, capthick=2,
+        markersize=9, linewidth=2.5,
+        label="g(|V|) (±V averaged)"
+    )
+
+    if G_fit_pS is not None and np.isfinite(G_fit_pS):
+        ax.axhline(
+            G_fit_pS,
+            color="red", linestyle="--", linewidth=2,
+            label=f"G (linear fit) = {G_fit_pS:.2f} pS"
+        )
+
+    ax.set_xlabel("|Voltage| (mV)", fontsize=12)
+    ax.set_ylabel("Conductance (pS)", fontsize=12)
+    ax.set_title("Gramicidin A — conductance vs |V|", fontsize=13)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10)
+
+    Path("results").mkdir(exist_ok=True)
+    out = Path("results") / "g_vs_absV.png"
+    plt.tight_layout()
+    plt.savefig(out, dpi=300)
+    plt.show()
+    print(f"  → {out}")
 
 # ====================== MAIN ======================
 
@@ -874,7 +1069,9 @@ if __name__ == "__main__":
     exp_df = pd.concat(exp_frames, ignore_index=True)
 
     # Сохраняем сырые результаты
+    exp_df = exp_df.rename(columns={"duration": "duration_sec"})
     exp_df.to_csv("results/iv_raw_intervals.csv", index=False)
+
 
     # Строим ВАХ
     summary = build_iv(exp_df, ctrl_df)
@@ -893,6 +1090,8 @@ if __name__ == "__main__":
     print("\n  → results/iv_summary.csv")
 
     plot_iv(summary)
+    plot_g_vs_v(summary, G_fit_pS=G_fit)
+    plot_g_absV(summary, G_fit_pS=G_fit) 
 
     # Итоговая статистика
     g_vals = summary['conductance_pS'].dropna()
