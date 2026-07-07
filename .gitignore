@@ -20,3 +20,4 @@ __pycache__/
 *.tpr
 *.cpt
 data/md_test/
+.DS_Store
