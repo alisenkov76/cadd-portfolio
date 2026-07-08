@@ -1,0 +1,37 @@
+* place dummy atoms at the center of each rings
+*
+
+set ncycles = 16
+
+read sequence POL @NCYCLES
+generate DUM warn
+
+coor set xdir    1.073 ydir   -6.104 zdir   12.312 sele segid dum .and. resi 1 end
+coor set xdir   -0.086 ydir   -6.896 zdir   10.675 sele segid dum .and. resi 2 end
+coor set xdir   -6.994 ydir    2.650 zdir   10.293 sele segid dum .and. resi 3 end
+coor set xdir   -7.335 ydir    3.904 zdir    8.571 sele segid dum .and. resi 4 end
+coor set xdir    4.278 ydir    6.782 zdir    9.165 sele segid dum .and. resi 5 end
+coor set xdir    5.930 ydir    6.490 zdir    7.806 sele segid dum .and. resi 6 end
+coor set xdir    3.217 ydir   -6.802 zdir    6.839 sele segid dum .and. resi 7 end
+coor set xdir    4.113 ydir   -5.350 zdir    8.156 sele segid dum .and. resi 8 end
+coor set xdir    4.113 ydir    5.350 zdir   -8.156 sele segid dum .and. resi 9 end
+coor set xdir    3.217 ydir    6.802 zdir   -6.839 sele segid dum .and. resi 10 end
+coor set xdir    1.073 ydir    6.104 zdir  -12.312 sele segid dum .and. resi 11 end
+coor set xdir   -0.086 ydir    6.896 zdir  -10.675 sele segid dum .and. resi 12 end
+coor set xdir   -7.335 ydir   -3.904 zdir   -8.571 sele segid dum .and. resi 13 end
+coor set xdir   -6.994 ydir   -2.650 zdir  -10.293 sele segid dum .and. resi 14 end
+coor set xdir    4.278 ydir   -6.782 zdir   -9.165 sele segid dum .and. resi 15 end
+coor set xdir    5.930 ydir   -6.490 zdir   -7.806 sele segid dum .and. resi 16 end
+
+scalar wmain set 0
+scalar wmain set 1.0 sele segid PROA .and. resi 15 end
+scalar wmain set 1.0 sele segid PROA .and. resi 13 end
+scalar wmain set 1.0 sele segid PROA .and. resi 11 end
+scalar wmain set 1.0 sele segid PROA .and. resi 9 end
+scalar wmain set 1.0 sele segid PROB .and. resi 9 end
+scalar wmain set 1.0 sele segid PROB .and. resi 15 end
+scalar wmain set 1.0 sele segid PROB .and. resi 13 end
+scalar wmain set 1.0 sele segid PROB .and. resi 11 end
+
+return
+
